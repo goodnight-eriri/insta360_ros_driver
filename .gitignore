@@ -5,7 +5,9 @@ include/camera/*
 include/stream/*
 .vscode
 *.pyc
-
+build/*
+install/*
+log/*
 !bag/raw/.gitkeep
 !bag/compressed/.gitkeep
 !bag/undistorted/.gitkeep

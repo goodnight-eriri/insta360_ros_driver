@@ -53,57 +53,34 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
     std::atomic<bool> stop_publisher_thread_{false};
-    size_t max_queue_size_ = 10;
+    size_t max_queue_size_ = 1;
     
     int skip_frame_ = 0;
     int frame_counter_ = 0;
     bool i_frame_only_ = false;
 
     void InitFFmpegDecoder() {
-        hw_type_ = AV_HWDEVICE_TYPE_CUDA;
-        const char* decoder_name = "h264_cuvid";
-
-        codec_ = avcodec_find_decoder_by_name(decoder_name);
+        // Force software decoding on Jetson/ARM64
+        hw_type_ = AV_HWDEVICE_TYPE_NONE;
+        codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
         if (!codec_) {
-            RCLCPP_WARN(this->get_logger(), "Hardware decoder not available, falling back to software");
-            hw_type_ = AV_HWDEVICE_TYPE_NONE;
-            codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
-            if (!codec_) {
-                RCLCPP_ERROR(this->get_logger(), "No H.264 decoder available");
-                return;
-            }
-        } else {
-            RCLCPP_INFO(this->get_logger(), "Using hardware H.264 decoder (NVDEC)");
+            RCLCPP_ERROR(this->get_logger(), "No H.264 software decoder available");
+            return;
         }
-
-        if (hw_type_ != AV_HWDEVICE_TYPE_NONE) {
-            int err = av_hwdevice_ctx_create(&hw_device_ctx_, hw_type_, nullptr, nullptr, 0);
-            if (err < 0) {
-                RCLCPP_WARN(this->get_logger(), "Failed to create hardware device context, falling back to software");
-                hw_type_ = AV_HWDEVICE_TYPE_NONE;
-                codec_ = avcodec_find_decoder(AV_CODEC_ID_H264);
-                if (!codec_) {
-                    RCLCPP_ERROR(this->get_logger(), "No H.264 decoder available");
-                    return;
-                }
-            }
-        }
+        RCLCPP_INFO(this->get_logger(), "Using software H.264 decoder");
 
         parser_ctx_ = av_parser_init(codec_->id);
         if (!parser_ctx_) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to create H.264 parser");
             CleanupFFmpegDecoder();
             return;
         }
 
         codec_ctx_ = avcodec_alloc_context3(codec_);
         if (!codec_ctx_) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to allocate codec context");
             CleanupFFmpegDecoder();
             return;
-        }
-
-        if (hw_type_ != AV_HWDEVICE_TYPE_NONE && hw_device_ctx_) {
-            codec_ctx_->hw_device_ctx = av_buffer_ref(hw_device_ctx_);
-            codec_ctx_->get_format = get_hw_format;
         }
 
         if (avcodec_open2(codec_ctx_, codec_, nullptr) < 0) {
@@ -114,22 +91,16 @@ private:
 
         pkt_ = av_packet_alloc();
         if (!pkt_) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to allocate packet");
             CleanupFFmpegDecoder();
             return;
         }
 
         hw_frame_ = av_frame_alloc();
         if (!hw_frame_) {
+            RCLCPP_ERROR(this->get_logger(), "Failed to allocate frame");
             CleanupFFmpegDecoder();
             return;
-        }
-
-        if (hw_type_ != AV_HWDEVICE_TYPE_NONE) {
-            sw_frame_ = av_frame_alloc();
-            if (!sw_frame_) {
-                CleanupFFmpegDecoder();
-                return;
-            }
         }
     }
 
@@ -223,9 +194,10 @@ private:
                     cv::Mat frame_copy = bgr_frame_.clone();
                     {
                         std::lock_guard<std::mutex> lock(queue_mutex_);
-                        if (frame_publish_queue_.size() < max_queue_size_) {
-                            frame_publish_queue_.push(frame_copy);
+                        while (!frame_publish_queue_.empty()) {
+                            frame_publish_queue_.pop();
                         }
+                        frame_publish_queue_.push(frame_copy);
                     }
                     queue_cv_.notify_one();
                 }
@@ -321,11 +293,17 @@ public:
         skip_frame_ = this->get_parameter("skip_frame").as_int();
         i_frame_only_ = this->get_parameter("i_frame_only").as_bool();
 
+        auto sub_qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort();
+        auto pub_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable();
+
         subscription_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
-            subscribe_topic, 10,
+            subscribe_topic,
+            sub_qos,
             std::bind(&H264DecoderNode::compressed_image_callback, this, std::placeholders::_1));
 
-        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(publish_topic, 10);
+        publisher_ = this->create_publisher<sensor_msgs::msg::Image>(
+            publish_topic,
+            pub_qos);
 
         publisher_thread_ = std::thread(&H264DecoderNode::PublisherThreadLoop, this);
         
