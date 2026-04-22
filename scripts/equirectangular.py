@@ -31,7 +31,10 @@ class EquirectangularNode(Node):
                 ('rotation_deg', [-0.5, 0.0, 1.1]),
                 ('gpu', True),
                 ('out_width', 1920),
-                ('out_height', 960)
+                ('out_height', 960),
+                ('front_from_left', False),
+                ('front_rotation', 0),
+                ('back_rotation', 0)
             ]
         )
         
@@ -83,7 +86,7 @@ class EquirectangularNode(Node):
         # Configure QoS for reliable communication with buffer size 1
         qos = rclpy.qos.QoSProfile(
             depth=1,
-            reliability=rclpy.qos.ReliabilityPolicy.RELIABLE
+            reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT
         )
         
         self.dual_fisheye_sub = self.create_subscription(
@@ -104,6 +107,9 @@ class EquirectangularNode(Node):
             self.out_width = self.get_parameter('out_width').get_parameter_value().integer_value
             self.out_height = self.get_parameter('out_height').get_parameter_value().integer_value
             self.gpu_enabled = self.get_parameter('gpu').get_parameter_value().bool_value
+            self.front_from_left = self.get_parameter('front_from_left').get_parameter_value().bool_value
+            self.front_rotation = self.get_parameter('front_rotation').get_parameter_value().integer_value
+            self.back_rotation = self.get_parameter('back_rotation').get_parameter_value().integer_value
             
             translation = self.get_parameter('translation').get_parameter_value().double_array_value
             self.tx, self.ty, self.tz = translation
@@ -120,6 +126,13 @@ class EquirectangularNode(Node):
             self.get_logger().info(f"  Rotation (deg): {rotation_deg}")
             self.get_logger().info(f"  Output size: {self.out_width}x{self.out_height}")
             self.get_logger().info(f"  GPU enabled: {self.gpu_enabled}")
+            self.get_logger().info(
+                f"  Fisheye order: front={'left' if self.front_from_left else 'right'}, "
+                f"back={'right' if self.front_from_left else 'left'}"
+            )
+            self.get_logger().info(
+                f"  Fisheye rotations: front={self.front_rotation}, back={self.back_rotation}"
+            )
         except Exception as e:
             self.get_logger().error(f"Error loading parameters: {e}")
             # Set defaults if parameter loading fails
@@ -155,6 +168,11 @@ class EquirectangularNode(Node):
             print(f"    gpu: {self.gpu_enabled}")
             print(f"    out_width: {self.out_width}")
             print(f"    out_height: {self.out_height}")
+            print(f"    front_from_left: {str(self.front_from_left).lower()}")
+            print(f"    front_rotation: {self.front_rotation}")
+            print(f"    back_rotation: {self.back_rotation}")
+            print(f"    out_width: {self.out_width}")
+            print(f"    out_height: {self.out_height}")
             print("="*50 + "\n")
             
             self.get_logger().info("Parameters saved to ROS parameter server and printed above")
@@ -170,7 +188,8 @@ class EquirectangularNode(Node):
         for param in params:
             # Check if a camera parameter was changed
             if param.name in ['cx_offset', 'cy_offset', 'crop_size', 'translation', 'rotation_deg',
-                             'out_width', 'out_height', 'gpu']:
+                             'out_width', 'out_height', 'gpu', 'front_from_left',
+                             'front_rotation', 'back_rotation']:
                 update_needed = True
                 
         if update_needed:
@@ -221,6 +240,16 @@ class EquirectangularNode(Node):
         if self.maps_initialized and not self.calibration_mode:
             self.maps_initialized = False
             self.get_logger().info("Parameters updated, remapping will occur on next image")
+
+    def rotate_fisheye(self, img: np.ndarray, rotation_code: int) -> np.ndarray:
+        """Rotate a fisheye half. 1=CW, -1=CCW, 2=180, 0=no rotation."""
+        if rotation_code == 1:
+            return cv2.rotate(img, cv2.ROTATE_90_CLOCKWISE)
+        if rotation_code == -1:
+            return cv2.rotate(img, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        if rotation_code in (2, -2):
+            return cv2.rotate(img, cv2.ROTATE_180)
+        return img.copy()
 
     def init_mapping(self, img_height: int, img_width: int):
         """Initialize mapping matrices for equirectangular projection."""
@@ -344,11 +373,13 @@ class EquirectangularNode(Node):
             
             img_height, img_width_full, _ = dual_fisheye_img.shape
             midpoint = img_width_full // 2
-            front_img_full = dual_fisheye_img[:, midpoint:]
-            back_img_full = dual_fisheye_img[:, :midpoint]
+            left_img = dual_fisheye_img[:, :midpoint]
+            right_img = dual_fisheye_img[:, midpoint:]
+            front_source = left_img if self.front_from_left else right_img
+            back_source = right_img if self.front_from_left else left_img
 
-            front_img_full = cv2.rotate(front_img_full, cv2.ROTATE_90_COUNTERCLOCKWISE)
-            back_img_full = cv2.rotate(back_img_full, cv2.ROTATE_90_CLOCKWISE)
+            front_img_full = self.rotate_fisheye(front_source, self.front_rotation)
+            back_img_full = self.rotate_fisheye(back_source, self.back_rotation)
             
             # Store original uncropped images (always update in calibration mode)
             if self.calibration_mode or self.original_front_img is None or self.original_front_img.shape != front_img_full.shape:

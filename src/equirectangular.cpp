@@ -20,6 +20,9 @@ EquirectangularNode::EquirectangularNode()
     declare_parameter("gpu", true);
     declare_parameter("out_width", 1920);
     declare_parameter("out_height", 960);
+    declare_parameter("front_from_left", false);
+    declare_parameter("front_rotation", 0);
+    declare_parameter("back_rotation", 0);
     
     // Load parameters
     loadParameters();
@@ -34,8 +37,9 @@ EquirectangularNode::EquirectangularNode()
     
     updateCameraParameters();
     
-    // Configure QoS
-    auto qos = rclcpp::QoS(1).reliable();
+    // Configure QoS for live camera images. SensorDataQoS uses best-effort,
+    // which matches common image publishers and avoids QoS incompatibility.
+    auto qos = rclcpp::SensorDataQoS();
     
     // Create publishers and subscribers
     dual_fisheye_sub_ = create_subscription<sensor_msgs::msg::Image>(
@@ -59,6 +63,9 @@ void EquirectangularNode::loadParameters()
         out_width_ = get_parameter("out_width").as_int();
         out_height_ = get_parameter("out_height").as_int();
         gpu_enabled_ = get_parameter("gpu").as_bool();
+        front_from_left_ = get_parameter("front_from_left").as_bool();
+        front_rotation_ = get_parameter("front_rotation").as_int();
+        back_rotation_ = get_parameter("back_rotation").as_int();
         
         auto translation = get_parameter("translation").as_double_array();
         tx_ = translation[0];
@@ -78,6 +85,11 @@ void EquirectangularNode::loadParameters()
                     rotation_deg[0], rotation_deg[1], rotation_deg[2]);
         RCLCPP_INFO(get_logger(), "  Output size: %dx%d", out_width_, out_height_);
         RCLCPP_INFO(get_logger(), "  GPU enabled: %s", gpu_enabled_ ? "true" : "false");
+        RCLCPP_INFO(get_logger(), "  Fisheye order: front=%s, back=%s",
+                    front_from_left_ ? "left" : "right",
+                    front_from_left_ ? "right" : "left");
+        RCLCPP_INFO(get_logger(), "  Fisheye rotations: front=%d, back=%d",
+                    front_rotation_, back_rotation_);
     } catch (const std::exception& e) {
         RCLCPP_ERROR(get_logger(), "Error loading parameters: %s", e.what());
         gpu_enabled_ = true;
@@ -261,6 +273,21 @@ cv::Mat EquirectangularNode::createEquirectangular(const cv::Mat& front_img, con
     return equirect;
 }
 
+cv::Mat EquirectangularNode::rotateFisheye(const cv::Mat& img, int rotation_code) const
+{
+    cv::Mat rotated;
+    if (rotation_code == 1) {
+        cv::rotate(img, rotated, cv::ROTATE_90_CLOCKWISE);
+    } else if (rotation_code == -1) {
+        cv::rotate(img, rotated, cv::ROTATE_90_COUNTERCLOCKWISE);
+    } else if (rotation_code == 2 || rotation_code == -2) {
+        cv::rotate(img, rotated, cv::ROTATE_180);
+    } else {
+        rotated = img.clone();
+    }
+    return rotated;
+}
+
 
 void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr dual_fisheye_msg)
 {
@@ -273,11 +300,14 @@ void EquirectangularNode::imageCallback(const sensor_msgs::msg::Image::SharedPtr
         int img_width_full = dual_fisheye_img.cols;
         int midpoint = img_width_full / 2;
         
-        cv::Mat front_img_full = dual_fisheye_img(cv::Rect(midpoint, 0, midpoint, img_height));
-        cv::Mat back_img_full = dual_fisheye_img(cv::Rect(0, 0, midpoint, img_height));
-        
-        cv::rotate(front_img_full, front_img_full, cv::ROTATE_90_COUNTERCLOCKWISE);
-        cv::rotate(back_img_full, back_img_full, cv::ROTATE_90_CLOCKWISE);
+        cv::Mat left_img = dual_fisheye_img(cv::Rect(0, 0, midpoint, img_height));
+        cv::Mat right_img = dual_fisheye_img(cv::Rect(midpoint, 0, midpoint, img_height));
+
+        cv::Mat front_source = front_from_left_ ? left_img : right_img;
+        cv::Mat back_source = front_from_left_ ? right_img : left_img;
+
+        cv::Mat front_img_full = rotateFisheye(front_source, front_rotation_);
+        cv::Mat back_img_full = rotateFisheye(back_source, back_rotation_);
         
         
         // Crop images based on crop_size parameter
@@ -346,6 +376,11 @@ rcl_interfaces::msg::SetParametersResult EquirectangularNode::parametersCallback
             param.get_name() == "out_width" ||
             param.get_name() == "out_height" ||
             param.get_name() == "gpu") {
+            update_needed = true;
+        }
+        if (param.get_name() == "front_from_left" ||
+            param.get_name() == "front_rotation" ||
+            param.get_name() == "back_rotation") {
             update_needed = true;
         }
     }

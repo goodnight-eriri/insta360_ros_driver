@@ -27,6 +27,7 @@ private:
     
     // Processing functions
     cv::Mat createEquirectangular(const cv::Mat& front_img, const cv::Mat& back_img);
+    cv::Mat rotateFisheye(const cv::Mat& img, int rotation_code) const;
     
     // ROS2 communication
     rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr dual_fisheye_sub_;
@@ -41,6 +42,9 @@ private:
     bool gpu_enabled_;
     int out_width_;
     int out_height_;
+    bool front_from_left_;
+    int front_rotation_;
+    int back_rotation_;
     
     // Camera parameters
     double cx_, cy_;
